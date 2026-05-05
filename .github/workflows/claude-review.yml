@@ -1,0 +1,146 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  claude-review:
+    name: Run Claude review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get list of changed JS files
+        id: changed
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \
+            | grep -E '\.(js|ts)$' \
+            | head -20 \
+            || true)
+          if [ -z "$CHANGED" ]; then
+            echo "files=" >> $GITHUB_OUTPUT
+            echo "No JS/TS files changed — skipping review."
+          else
+            echo "files<<DELIM" >> $GITHUB_OUTPUT
+            echo "$CHANGED" >> $GITHUB_OUTPUT
+            echo "DELIM" >> $GITHUB_OUTPUT
+            echo "Changed files:"
+            echo "$CHANGED"
+          fi
+
+      - name: Setup Node.js
+        if: steps.changed.outputs.files != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        if: steps.changed.outputs.files != ''
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Claude review
+        if: steps.changed.outputs.files != ''
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          FILES="${{ steps.changed.outputs.files }}"
+          PROMPT=$(cat <<'PROMPT_END'
+          You are reviewing the following changed files in this pull request:
+
+          FILES_PLACEHOLDER
+
+          Read each file, then review the code against the conventions in CLAUDE.md.
+
+          ## Review categories
+
+          Report findings in exactly these three categories — nothing else:
+          1. Bugs — logic errors, null/undefined hazards, incorrect HTTP codes, broken control flow.
+          2. Security — injection risk, secrets in code, missing auth checks, leaked error details.
+          3. Error handling — missing try/catch, raw DB errors returned to clients, missing validateRequest, responses outside the { data, meta } envelope.
+
+          ## Do NOT report — no exceptions
+
+          - Style or formatting (indentation, quotes, semicolons, line length).
+          - Naming preferences when existing names are correct.
+          - Micro-performance suggestions.
+          - Test coverage gaps already matching CLAUDE.md's three-test rule.
+          - Missing JSDoc, comments, or type annotations.
+          - "Consider" or "perhaps" suggestions — only confirmed defects.
+
+          If clean against all three categories, return an empty array.
+
+          ## Output format
+
+          Return ONLY a valid JSON array. No prose. No markdown fences. No preamble. Parseable by JSON.parse.
+
+          Each finding has these exact fields:
+          {
+            "file": "src/routes/orders.js",
+            "line": 42,
+            "severity": "high" | "medium" | "low",
+            "category": "bug" | "security" | "error-handling",
+            "issue": "One sentence describing the defect.",
+            "suggestion": "One sentence with the concrete fix."
+          }
+
+          If no issues: return exactly [].
+          PROMPT_END
+          )
+          PROMPT="${PROMPT//FILES_PLACEHOLDER/$FILES}"
+
+          claude -p "$PROMPT" --output-format json > /tmp/raw_output.json
+
+          echo "Raw output saved to /tmp/raw_output.json"
+          cat /tmp/raw_output.json
+
+          RESULT=$(jq -r '.result' /tmp/raw_output.json)
+          echo "Result extracted:"
+          echo "$RESULT"
+          echo "$RESULT" > /tmp/findings.json
+
+          if jq empty /tmp/findings.json 2>/dev/null; then
+            echo "✅ findings.json is valid JSON"
+          else
+            echo "⚠️ findings.json is NOT valid JSON — emitting empty array"
+            echo "[]" > /tmp/findings.json
+          fi
+
+      - name: Post review comment
+        if: steps.changed.outputs.files != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const findings = JSON.parse(fs.readFileSync('/tmp/findings.json', 'utf8'));
+
+            let body;
+            if (!Array.isArray(findings) || findings.length === 0) {
+              body = '✅ **Claude Code review** — no high or medium severity issues found.';
+            } else {
+              const lines = findings.map(f => {
+                const sev = (f.severity || 'unknown').toUpperCase();
+                const cat = f.category || 'unknown';
+                return `- **${sev} · ${cat}** — \`${f.file}:${f.line}\`\n  ${f.issue}\n  *Fix:* ${f.suggestion}`;
+              });
+              body = `### 🔍 Claude Code Review\n\n${findings.length} finding(s):\n\n${lines.join('\n\n')}`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body
+            });
