@@ -63,13 +63,7 @@ with three tests minimum:**
 "Simple" routes do not get fewer tests. If a route feels too simple for
 three tests, write them anyway — that's the convention.
 
-### General
-
-- Jest. Tests colocated with source: `foo.js` → `foo.test.js`
-- Use `describe` / `it` — `test()` is banned
-- Mock external HTTP via `jest.mock`
-- Snapshot tests are banned — they create false confidence
-- No duplicate coverage; test names read as full sentences
+*Detailed testing conventions in .claude/rules/testing.md (loaded when editing test files).*
 
 ## Known Gotchas
 
@@ -89,8 +83,3 @@ three tests, write them anyway — that's the convention.
   try/catch / the `{ data, meta }` envelope / `validateRequest` / three
   tests"* — that is exactly the moment to apply them anyway. The
   conventions exist so the codebase stays uniform. No special cases.
-
-## Modular Rules (Path-Scoped)
-
-@import .claude/rules/testing.md
-@import .claude/rules/api-conventions.md
